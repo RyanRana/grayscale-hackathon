@@ -6,6 +6,9 @@ import { locStr } from './location.js';
 import { speakTo } from './speech.js';
 import { capEvidence } from './capture.js';
 
+// Track how many messages we've rendered per call to enable incremental appends
+const renderedMsgCount = {};
+
 export function triggerDisp(a, now) {
   if (S.dispatchLock) return;
   S.dispatchLock = true;
@@ -19,6 +22,7 @@ export function triggerDisp(a, now) {
   const station = stationList[0] || null;
   const call = { id: cid, start: Date.now(), status: 'CONNECTING', msgs: [], analysis: a, ev, svcType: st, mapId: `map-${cid}`, station };
   S.dispatchCalls.unshift(call);
+  renderedMsgCount[cid] = 0;
   sTab('dispatch');
 
   const loc = locStr();
@@ -66,6 +70,8 @@ export function triggerDisp(a, now) {
   next();
 }
 
+// ===== MAP (created once, never destroyed during dispatch) =====
+
 function initMap(cid) {
   const el = document.getElementById(`map-${cid}`);
   if (!el || !S.myLoc || S.maps[cid]) return;
@@ -75,24 +81,30 @@ function initMap(cid) {
   const map = L.map(el, { zoomControl: false, attributionControl: false }).setView([S.myLoc.lat, S.myLoc.lng], 13);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18 }).addTo(map);
 
+  // Scene marker
   L.marker([S.myLoc.lat, S.myLoc.lng], { icon: L.divIcon({ html: '<div style="background:#ff1744;width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 8px #ff174488"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(map).bindPopup('<b>📍 Scene</b>');
 
+  // Hospital marker
   if (S.hospital) L.marker([S.hospital.lat, S.hospital.lon], { icon: L.divIcon({ html: '<div style="background:#42a5f5;width:14px;height:14px;border-radius:3px;border:2px solid #fff;font-size:8px;color:#fff;text-align:center;line-height:12px;font-weight:bold">H</div>', iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(map).bindPopup(`<b>🏥 ${S.hospital.name}</b>`);
 
+  // Station origin
   let sLat, sLng, stLabel;
   if (call?.station) { sLat = call.station.lat; sLng = call.station.lon; stLabel = call.station.name; }
   else { const a = Math.random() * Math.PI * 2; sLat = S.myLoc.lat + Math.cos(a) * 0.02; sLng = S.myLoc.lng + Math.sin(a) * 0.025; stLabel = 'Station'; }
 
   L.marker([sLat, sLng], { icon: L.divIcon({ html: `<div style="background:${svc.c};width:14px;height:14px;border-radius:3px;border:2px solid #fff;font-size:9px;text-align:center">${svc.i}</div>`, iconSize: [14, 14], iconAnchor: [7, 7] }) }).addTo(map).bindPopup(`<b>${svc.i} ${stLabel}</b>`);
 
+  // Route line
   L.polyline([[sLat, sLng], [S.myLoc.lat, S.myLoc.lng]], { color: svc.c, weight: 2, dashArray: '6,8', opacity: 0.4 }).addTo(map);
 
-  const rm = L.marker([sLat, sLng], { icon: L.divIcon({ html: `<div style="background:${svc.c};width:18px;height:18px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 12px ${svc.c}88;font-size:10px;text-align:center;line-height:14px">${svc.i}</div>`, iconSize: [18, 18], iconAnchor: [9, 9] }) }).addTo(map);
+  // Animated responder
+  const rm = L.marker([sLat, sLng], { icon: L.divIcon({ html: `<div style="background:${svc.c};width:22px;height:22px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 14px ${svc.c}aa;font-size:12px;text-align:center;line-height:17px">${svc.i}</div>`, iconSize: [22, 22], iconAnchor: [11, 11] }) }).addTo(map);
 
   const bounds = L.latLngBounds([[S.myLoc.lat, S.myLoc.lng], [sLat, sLng]]);
   if (S.hospital) bounds.extend([S.hospital.lat, S.hospital.lon]);
   map.fitBounds(bounds.pad(0.2));
 
+  // 35s animation (120 steps x 290ms)
   let step = 0;
   const totalSteps = 120;
   const anim = setInterval(() => {
@@ -108,44 +120,71 @@ function initMap(cid) {
   S.maps[cid] = map;
 }
 
+// ===== RENDER (incremental — never destroys map) =====
+
+const stC = {
+  'CONNECTING': 'background:#1a237e55;color:#7986cb',
+  'ACTIVE': 'background:#e6510033;color:#ffab40',
+  'DISPATCHED': 'background:#1b5e2044;color:#69f0ae',
+  'ON SCENE': 'background:#00695c33;color:#4db6ac',
+  'RESOLVED': 'background:#37474f33;color:#78909c'
+};
+const sM2 = {
+  aegis: { l: 'AEGIS', c: 'aegis', b: 'ab2' },
+  dispatch: { l: '911', c: 'ds', b: 'db' },
+  officer: { l: 'OFFICER', c: 'officer', b: 'ob' },
+  ems: { l: 'MEDIC', c: 'ems', b: 'eb2' },
+  fire: { l: 'FIRE', c: 'fire', b: 'fb' },
+  speaker: { l: 'SPEAKER', c: 'speaker', b: 'sb' },
+  system: { l: 'SYS', c: 'sys', b: 'syb' }
+};
+
+function renderMsgHTML(m) {
+  const i = sM2[m.s] || sM2.system;
+  return `<div class="dm"><div class="mono sn ${i.c}">${i.l} <span style="font-weight:300;color:#2a3f55;font-size:8px">${fmtS(m.time)}</span></div><div class="bub ${i.b}">${m.t}</div>${m.ev ? `<div class="evi"><img src="${m.ev}"/><div class="mono evi-l">📸 ${fmtS(m.time)}</div></div>` : ''}</div>`;
+}
+
+function renderCardHTML(call) {
+  const svc = SVC[call.svcType] || SVC.EMS;
+  const st = stC[call.status] || stC.ACTIVE;
+  return `<div class="dc" id="card-${call.id}"><div class="dch"><div><span class="mono" style="font-size:9px;padding:2px 8px;border-radius:2px;margin-right:6px;background:${svc.c}22;color:${svc.c}">${svc.i} ${svc.l}</span><span class="mono" style="font-size:11px;color:#ab47bc;font-weight:600">${call.id}</span></div><span class="mono dc-status" id="status-${call.id}" style="font-size:9px;padding:2px 8px;border-radius:2px;${st}">${call.status}</span></div><div class="dcc" id="chat-${call.id}"></div><div class="dmap" id="${call.mapId}"></div></div>`;
+}
+
 export function rDisp() {
   const active = S.dispatchCalls.filter(c => c.status !== 'RESOLVED').length;
   document.getElementById('dBg').textContent = active > 0 ? `(${active})` : '';
-  const el = document.getElementById('dL');
-  if (!S.dispatchCalls.length) { el.innerHTML = '<div class="es2">Monitoring</div>'; return; }
+  const container = document.getElementById('dL');
+  if (!S.dispatchCalls.length) { container.innerHTML = '<div class="es2">Monitoring</div>'; return; }
 
-  const stC = {
-    'CONNECTING': 'background:#1a237e55;color:#7986cb',
-    'ACTIVE': 'background:#e6510033;color:#ffab40',
-    'DISPATCHED': 'background:#1b5e2044;color:#69f0ae',
-    'ON SCENE': 'background:#00695c33;color:#4db6ac',
-    'RESOLVED': 'background:#37474f33;color:#78909c'
-  };
-  const sM2 = {
-    aegis: { l: 'AEGIS', c: 'aegis', b: 'ab2' },
-    dispatch: { l: '911', c: 'ds', b: 'db' },
-    officer: { l: 'OFFICER', c: 'officer', b: 'ob' },
-    ems: { l: 'MEDIC', c: 'ems', b: 'eb2' },
-    fire: { l: 'FIRE', c: 'fire', b: 'fb' },
-    speaker: { l: 'SPEAKER', c: 'speaker', b: 'sb' },
-    system: { l: 'SYS', c: 'sys', b: 'syb' }
-  };
+  for (const call of S.dispatchCalls) {
+    let card = document.getElementById(`card-${call.id}`);
 
-  el.innerHTML = S.dispatchCalls.map(call => {
-    const st = stC[call.status] || stC.ACTIVE;
-    const svc = SVC[call.svcType] || SVC.EMS;
-    const msgs = call.msgs.map(m => {
-      const i = sM2[m.s] || sM2.system;
-      return `<div class="dm"><div class="mono sn ${i.c}">${i.l} <span style="font-weight:300;color:#2a3f55;font-size:8px">${fmtS(m.time)}</span></div><div class="bub ${i.b}">${m.t}</div>${m.ev ? `<div class="evi"><img src="${m.ev}"/><div class="mono evi-l">📸 ${fmtS(m.time)}</div></div>` : ''}</div>`;
-    }).join('');
-    return `<div class="dc"><div class="dch"><div><span class="mono" style="font-size:9px;padding:2px 8px;border-radius:2px;margin-right:6px;background:${svc.c}22;color:${svc.c}">${svc.i} ${svc.l}</span><span class="mono" style="font-size:11px;color:#ab47bc;font-weight:600">${call.id}</span></div><span class="mono" style="font-size:9px;padding:2px 8px;border-radius:2px;${st}">${call.status}</span></div><div class="dcc" id="chat-${call.id}">${msgs}</div><div class="dmap" id="${call.mapId}"></div></div>`;
-  }).join('');
+    // Create card if it doesn't exist yet
+    if (!card) {
+      // Clear placeholder text if this is the first card
+      if (container.querySelector('.es2')) container.innerHTML = '';
+      container.insertAdjacentHTML('afterbegin', renderCardHTML(call));
+      card = document.getElementById(`card-${call.id}`);
+    }
 
-  requestAnimationFrame(() => {
-    const ch = document.getElementById(`chat-${S.dispatchCalls[0]?.id}`);
-    if (ch) ch.scrollTop = ch.scrollHeight;
-    S.dispatchCalls.forEach(c => {
-      if (S.maps[c.id]) { S.maps[c.id].remove(); delete S.maps[c.id]; if (['DISPATCHED', 'ON SCENE', 'RESOLVED'].includes(c.status)) setTimeout(() => initMap(c.id), 100); }
-    });
-  });
+    // Update status badge (cheap, no DOM rebuild)
+    const statusEl = document.getElementById(`status-${call.id}`);
+    if (statusEl) {
+      statusEl.textContent = call.status;
+      statusEl.setAttribute('style', `font-size:9px;padding:2px 8px;border-radius:2px;${stC[call.status] || stC.ACTIVE}`);
+    }
+
+    // Append only NEW messages (don't re-render existing ones)
+    const chatEl = document.getElementById(`chat-${call.id}`);
+    if (chatEl) {
+      const alreadyRendered = renderedMsgCount[call.id] || 0;
+      const newMsgs = call.msgs.slice(alreadyRendered);
+      if (newMsgs.length > 0) {
+        chatEl.insertAdjacentHTML('beforeend', newMsgs.map(renderMsgHTML).join(''));
+        renderedMsgCount[call.id] = call.msgs.length;
+        // Auto-scroll chat to bottom
+        requestAnimationFrame(() => { chatEl.scrollTop = chatEl.scrollHeight; });
+      }
+    }
+  }
 }
